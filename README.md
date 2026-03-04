@@ -46,7 +46,8 @@ Esempi:
 ### `wp-migrate init`
 
 - crea `.wp-migrate`
-- salva la configurazione in `.wp-migrate/config`
+- salva la configurazione condivisa in `.wp-migrate/config`
+- salva la configurazione locale della macchina in `.wp-migrate/config.local`
 - inizializza un repository git locale dentro `.wp-migrate`
 - collega il remote `origin`
 
@@ -64,6 +65,7 @@ Esempi:
 
 - aggiorna il contenuto di `.wp-migrate` con `git fetch` + `git pull`
 - ricostruisce una cache locale in `.wp-migrate/.cache` per gli asset splittati senza sporcare il repository git
+- preserva la configurazione locale in `.wp-migrate/config.local`
 
 ### `wp-migrate sync`
 

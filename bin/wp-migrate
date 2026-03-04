@@ -6,6 +6,7 @@ MIGRATE_DIR=".wp-migrate"
 MIGRATE_GITIGNORE="$MIGRATE_DIR/.gitignore"
 MIGRATE_CACHE_DIR="$MIGRATE_DIR/.cache"
 CONFIG_FILE="$MIGRATE_DIR/config"
+LOCAL_CONFIG_FILE="$MIGRATE_DIR/config.local"
 DATABASE_DUMP="$MIGRATE_DIR/database.sql"
 CONTENT_ARCHIVE="$MIGRATE_DIR/uploads.tar.gz"
 DEFAULT_BRANCH="main"
@@ -100,6 +101,7 @@ ensure_migrate_dir() {
 write_migrate_gitignore() {
   cat > "$MIGRATE_GITIGNORE" <<'EOF'
 .cache/
+config.local
 EOF
 }
 
@@ -133,20 +135,6 @@ validate_remote_repository() {
 
 validate_url() {
   [[ "$1" =~ ^https?://[^[:space:]]+$ ]]
-}
-
-config_value() {
-  local file_path="$1"
-  local key="$2"
-
-  [[ -f "$file_path" ]] || return 0
-
-  (
-    unset REMOTE_REPOSITORY REMOTE_SITE_URL LOCAL_SITE_URL VERSION BRANCH
-    # shellcheck disable=SC1090
-    source "$file_path"
-    eval "printf '%s' \"\${$key:-}\""
-  )
 }
 
 manifest_path() {
@@ -280,33 +268,62 @@ hydrate_cached_artifacts() {
   hydrate_cached_asset_if_present "$CONTENT_ARCHIVE" "$MIGRATE_CACHE_DIR/$(basename "$CONTENT_ARCHIVE")"
 }
 
-save_config() {
+save_shared_config() {
   local remote_repository="$1"
   local remote_site_url="$2"
-  local local_site_url="$3"
-  local version="$4"
-  local branch="${5:-$DEFAULT_BRANCH}"
+  local version="$3"
+  local branch="${4:-$DEFAULT_BRANCH}"
 
   cat > "$CONFIG_FILE" <<EOF
 REMOTE_REPOSITORY='$remote_repository'
 REMOTE_SITE_URL='$remote_site_url'
-LOCAL_SITE_URL='$local_site_url'
 VERSION='$version'
 BRANCH='$branch'
 EOF
 }
 
-load_config() {
+save_local_config() {
+  local local_site_url="$1"
+
+  cat > "$LOCAL_CONFIG_FILE" <<EOF
+LOCAL_SITE_URL='$local_site_url'
+EOF
+}
+
+load_shared_config() {
   [[ -f "$CONFIG_FILE" ]] || die "Configurazione non trovata. Esegui \`wp-migrate init\`."
 
+  unset REMOTE_REPOSITORY REMOTE_SITE_URL VERSION BRANCH
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
 
   [[ -n "${REMOTE_REPOSITORY:-}" ]] || die "Configurazione non valida: REMOTE_REPOSITORY mancante."
   [[ -n "${REMOTE_SITE_URL:-}" ]] || die "Configurazione non valida: REMOTE_SITE_URL mancante."
-  [[ -n "${LOCAL_SITE_URL:-}" ]] || die "Configurazione non valida: LOCAL_SITE_URL mancante."
   [[ -n "${VERSION:-}" ]] || VERSION="0.0.0"
   [[ -n "${BRANCH:-}" ]] || BRANCH="$DEFAULT_BRANCH"
+}
+
+load_local_config() {
+  unset LOCAL_SITE_URL
+
+  if [[ -f "$LOCAL_CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$LOCAL_CONFIG_FILE"
+  elif [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+
+    if [[ -n "${LOCAL_SITE_URL:-}" ]]; then
+      save_local_config "$LOCAL_SITE_URL"
+    fi
+  fi
+
+  [[ -n "${LOCAL_SITE_URL:-}" ]] || die "Configurazione locale non trovata. Esegui \`wp-migrate init\` oppure crea $LOCAL_CONFIG_FILE."
+}
+
+load_config() {
+  load_shared_config
+  load_local_config
 }
 
 bump_patch_version() {
@@ -371,11 +388,12 @@ cmd_init() {
     error "URL locale non valido."
   done
 
-  save_config "$remote_repository" "$remote_site_url" "$local_site_url" "0.0.0" "$DEFAULT_BRANCH"
+  save_shared_config "$remote_repository" "$remote_site_url" "0.0.0" "$DEFAULT_BRANCH"
+  save_local_config "$local_site_url"
   load_config
   configure_remote
 
-  info "Configurazione salvata in $CONFIG_FILE"
+  info "Configurazione salvata in $CONFIG_FILE e $LOCAL_CONFIG_FILE"
 }
 
 cmd_push() {
@@ -411,7 +429,7 @@ cmd_push() {
   trap - EXIT
 
   next_version="$(bump_patch_version "$VERSION")"
-  save_config "$REMOTE_REPOSITORY" "$REMOTE_SITE_URL" "$LOCAL_SITE_URL" "$next_version" "$BRANCH"
+  save_shared_config "$REMOTE_REPOSITORY" "$REMOTE_SITE_URL" "$next_version" "$BRANCH"
 
   info "Creo commit e tag v$next_version..."
   git_commit_if_needed "Release v$next_version"
@@ -425,30 +443,12 @@ cmd_push() {
 }
 
 cmd_pull() {
-  local bootstrap_pull=0
-  local temp_dir=""
-  local backup_config=""
-  local local_remote_repository=""
-  local local_remote_site_url=""
-  local local_local_site_url=""
-  local local_version=""
-  local local_branch=""
-  local remote_version=""
-  local remote_remote_site_url=""
-
   require_command git
 
   ensure_migrate_dir
   load_config
   ensure_git_repo
   configure_remote
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/wp-migrate.XXXXXX")"
-  trap 'rm -rf "$temp_dir"' EXIT
-
-  backup_config="$temp_dir/config.backup"
-  if [[ -f "$CONFIG_FILE" ]]; then
-    cp "$CONFIG_FILE" "$backup_config"
-  fi
 
   info "Aggiorno .wp-migrate dal repository remoto..."
   git -C "$MIGRATE_DIR" fetch --tags origin
@@ -456,33 +456,13 @@ cmd_pull() {
   if git_has_head; then
     git -C "$MIGRATE_DIR" checkout "$BRANCH"
   else
-    bootstrap_pull=1
     rm -f "$CONFIG_FILE" "$MIGRATE_GITIGNORE"
     git -C "$MIGRATE_DIR" checkout -B "$BRANCH" --track "origin/$BRANCH"
   fi
 
   git -C "$MIGRATE_DIR" pull origin "$BRANCH"
 
-  if [[ "$bootstrap_pull" -eq 1 && -f "$backup_config" && -f "$CONFIG_FILE" ]]; then
-    local_remote_repository="$(config_value "$backup_config" "REMOTE_REPOSITORY")"
-    local_remote_site_url="$(config_value "$backup_config" "REMOTE_SITE_URL")"
-    local_local_site_url="$(config_value "$backup_config" "LOCAL_SITE_URL")"
-    local_version="$(config_value "$backup_config" "VERSION")"
-    local_branch="$(config_value "$backup_config" "BRANCH")"
-    remote_remote_site_url="$(config_value "$CONFIG_FILE" "REMOTE_SITE_URL")"
-    remote_version="$(config_value "$CONFIG_FILE" "VERSION")"
-
-    save_config \
-      "${local_remote_repository:-$REMOTE_REPOSITORY}" \
-      "${remote_remote_site_url:-${local_remote_site_url:-$REMOTE_SITE_URL}}" \
-      "${local_local_site_url:-$LOCAL_SITE_URL}" \
-      "${remote_version:-${local_version:-$VERSION}}" \
-      "${local_branch:-$BRANCH}"
-  fi
-
   hydrate_cached_artifacts
-  rm -rf "$temp_dir"
-  trap - EXIT
   info "Pull completato."
 }
 

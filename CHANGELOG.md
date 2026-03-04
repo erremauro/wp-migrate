@@ -16,10 +16,12 @@ e questo progetto aderisce a [Semantic Versioning](https://semver.org/lang/it/).
 
 - `push` genera ora file singoli o chunk `.part-XXXX` con manifest dedicato, ripulendo gli artifact obsoleti prima del commit.
 - I chunk generati per gli artifact di migrazione ora usano una dimensione massima di circa 50 MB, in linea con il limite consigliato da GitHub.
+- La configurazione locale della macchina ora viene salvata in `.wp-migrate/config.local`, separata dalla configurazione condivisa versionata nel repository.
 
 ### Fixed
 
 - `pull` su una nuova installazione locale inizializzata con `wp-migrate init` non fallisce piu per conflitto tra i file locali `config` e `.gitignore` e il primo checkout del branch remoto.
+- `sync` non usa piu accidentalmente l'URL locale come valore sorgente del `search-replace` quando la configurazione locale viene inizializzata e poi allineata dal repository remoto.
 
 ## [0.1.0] - 2026-03-04
 
