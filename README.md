@@ -54,7 +54,7 @@ Esempi:
 
 - esporta il database in un file temporaneo
 - comprime `wp-content/uploads` in un archivio temporaneo
-- salva database e archivio in `.wp-migrate` come file singoli oppure chunk `.part-XXXX` se superano circa 95 MB
+- salva database e archivio in `.wp-migrate` come file singoli oppure chunk `.part-XXXX` se superano circa 50 MB
 - genera un manifest per ogni asset e rimuove eventuali chunk obsoleti da push precedenti
 - incrementa la versione patch in config
 - crea commit e tag `vX.Y.Z`

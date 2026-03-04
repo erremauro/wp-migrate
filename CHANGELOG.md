@@ -15,6 +15,7 @@ e questo progetto aderisce a [Semantic Versioning](https://semver.org/lang/it/).
 ### Changed
 
 - `push` genera ora file singoli o chunk `.part-XXXX` con manifest dedicato, ripulendo gli artifact obsoleti prima del commit.
+- I chunk generati per gli artifact di migrazione ora usano una dimensione massima di circa 50 MB, in linea con il limite consigliato da GitHub.
 
 ## [0.1.0] - 2026-03-04
 
