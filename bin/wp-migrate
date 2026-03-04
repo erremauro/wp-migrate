@@ -3,10 +3,13 @@
 set -euo pipefail
 
 MIGRATE_DIR=".wp-migrate"
+MIGRATE_GITIGNORE="$MIGRATE_DIR/.gitignore"
+MIGRATE_CACHE_DIR="$MIGRATE_DIR/.cache"
 CONFIG_FILE="$MIGRATE_DIR/config"
 DATABASE_DUMP="$MIGRATE_DIR/database.sql"
 CONTENT_ARCHIVE="$MIGRATE_DIR/uploads.tar.gz"
 DEFAULT_BRANCH="main"
+MAX_CHUNK_BYTES=$((95 * 1024 * 1024))
 WP_CMD=()
 UPLOADS_PATH="wp-content/uploads"
 
@@ -90,6 +93,14 @@ ensure_wordpress_installation() {
 
 ensure_migrate_dir() {
   mkdir -p "$MIGRATE_DIR"
+  mkdir -p "$MIGRATE_CACHE_DIR"
+  write_migrate_gitignore
+}
+
+write_migrate_gitignore() {
+  cat > "$MIGRATE_GITIGNORE" <<'EOF'
+.cache/
+EOF
 }
 
 ensure_git_repo() {
@@ -122,6 +133,137 @@ validate_remote_repository() {
 
 validate_url() {
   [[ "$1" =~ ^https?://[^[:space:]]+$ ]]
+}
+
+manifest_path() {
+  printf '%s.manifest' "$1"
+}
+
+cleanup_asset_storage() {
+  local base_path="$1"
+
+  rm -f "$base_path" "$(manifest_path "$base_path")"
+  rm -f "$base_path".part-*
+}
+
+count_parts() {
+  local base_path="$1"
+  local parts=()
+
+  shopt -s nullglob
+  parts=("$base_path".part-*)
+  shopt -u nullglob
+
+  printf '%s' "${#parts[@]}"
+}
+
+write_asset_manifest() {
+  local base_path="$1"
+  local mode="$2"
+  local size_bytes="$3"
+  local part_count="$4"
+
+  cat > "$(manifest_path "$base_path")" <<EOF
+MODE='$mode'
+SIZE_BYTES='$size_bytes'
+PART_COUNT='$part_count'
+EOF
+}
+
+store_asset() {
+  local source_path="$1"
+  local target_path="$2"
+  local size_bytes
+  local part_count
+
+  [[ -f "$source_path" ]] || die "Asset sorgente non trovato: $source_path"
+
+  cleanup_asset_storage "$target_path"
+  size_bytes="$(wc -c < "$source_path" | tr -d '[:space:]')"
+
+  if (( size_bytes > MAX_CHUNK_BYTES )); then
+    split -b "$MAX_CHUNK_BYTES" -d -a 4 "$source_path" "$target_path.part-"
+    part_count="$(count_parts "$target_path")"
+    [[ "$part_count" -gt 0 ]] || die "Split fallito per $target_path"
+    write_asset_manifest "$target_path" "split" "$size_bytes" "$part_count"
+  else
+    cp "$source_path" "$target_path"
+    write_asset_manifest "$target_path" "single" "$size_bytes" "1"
+  fi
+}
+
+materialize_asset() {
+  local base_path="$1"
+  local target_path="$2"
+  local manifest
+  local parts=()
+
+  mkdir -p "$(dirname "$target_path")"
+  rm -f "$target_path"
+
+  manifest="$(manifest_path "$base_path")"
+
+  if [[ -f "$manifest" ]]; then
+    # shellcheck disable=SC1090
+    source "$manifest"
+
+    case "${MODE:-}" in
+      single)
+        [[ -f "$base_path" ]] || die "Asset non trovato: $base_path"
+        cp "$base_path" "$target_path"
+        ;;
+      split)
+        shopt -s nullglob
+        parts=("$base_path".part-*)
+        shopt -u nullglob
+        [[ "${#parts[@]}" -gt 0 ]] || die "Chunk non trovati per $base_path"
+        cat "${parts[@]}" > "$target_path"
+        ;;
+      *)
+        die "Manifest non valido per $base_path"
+        ;;
+    esac
+
+    return 0
+  fi
+
+  if [[ -f "$base_path" ]]; then
+    cp "$base_path" "$target_path"
+    return 0
+  fi
+
+  shopt -s nullglob
+  parts=("$base_path".part-*)
+  shopt -u nullglob
+  [[ "${#parts[@]}" -gt 0 ]] || die "Asset non trovato: $base_path"
+  cat "${parts[@]}" > "$target_path"
+}
+
+hydrate_cached_asset_if_present() {
+  local base_path="$1"
+  local cache_path="$2"
+  local parts=()
+
+  rm -f "$cache_path"
+
+  if [[ -f "$base_path" || -f "$(manifest_path "$base_path")" ]]; then
+    materialize_asset "$base_path" "$cache_path"
+    return 0
+  fi
+
+  shopt -s nullglob
+  parts=("$base_path".part-*)
+  shopt -u nullglob
+
+  if [[ "${#parts[@]}" -gt 0 ]]; then
+    materialize_asset "$base_path" "$cache_path"
+  fi
+}
+
+hydrate_cached_artifacts() {
+  mkdir -p "$MIGRATE_CACHE_DIR"
+  hydrate_cached_asset_if_present "$DATABASE_DUMP" "$MIGRATE_CACHE_DIR/$(basename "$DATABASE_DUMP")"
+  hydrate_cached_asset_if_present "$CONTENT_ARCHIVE" "$MIGRATE_CACHE_DIR/$(basename "$CONTENT_ARCHIVE")"
 }
 
 save_config() {
@@ -224,22 +366,35 @@ cmd_init() {
 
 cmd_push() {
   local next_version
+  local temp_dir
 
   ensure_wordpress_installation
   require_command git
   resolve_wp_cli
   require_command tar
+  require_command split
 
   ensure_migrate_dir
   ensure_git_repo
   load_config
   configure_remote
 
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/wp-migrate.XXXXXX")"
+  trap 'rm -rf "$temp_dir"' EXIT
+
   info "Esporto il database WordPress..."
-  "${WP_CMD[@]}" db export "$DATABASE_DUMP" --add-drop-table
+  "${WP_CMD[@]}" db export "$temp_dir/$(basename "$DATABASE_DUMP")" --add-drop-table
 
   info "Comprimo $UPLOADS_PATH..."
-  tar -czf "$CONTENT_ARCHIVE" "$UPLOADS_PATH"
+  tar -czf "$temp_dir/$(basename "$CONTENT_ARCHIVE")" "$UPLOADS_PATH"
+
+  info "Preparo gli artifact per git..."
+  store_asset "$temp_dir/$(basename "$DATABASE_DUMP")" "$DATABASE_DUMP"
+  store_asset "$temp_dir/$(basename "$CONTENT_ARCHIVE")" "$CONTENT_ARCHIVE"
+  hydrate_cached_artifacts
+
+  rm -rf "$temp_dir"
+  trap - EXIT
 
   next_version="$(bump_patch_version "$VERSION")"
   save_config "$REMOTE_REPOSITORY" "$REMOTE_SITE_URL" "$LOCAL_SITE_URL" "$next_version" "$BRANCH"
@@ -273,6 +428,7 @@ cmd_pull() {
   fi
 
   git -C "$MIGRATE_DIR" pull origin "$BRANCH"
+  hydrate_cached_artifacts
   info "Pull completato."
 }
 
@@ -296,20 +452,20 @@ cmd_sync() {
   done
 
   load_config
-  [[ -f "$DATABASE_DUMP" ]] || die "Dump database non trovato in .wp-migrate."
+  materialize_asset "$DATABASE_DUMP" "$MIGRATE_CACHE_DIR/$(basename "$DATABASE_DUMP")"
 
   info "Importo il dump SQL..."
-  "${WP_CMD[@]}" db import "$DATABASE_DUMP"
+  "${WP_CMD[@]}" db import "$MIGRATE_CACHE_DIR/$(basename "$DATABASE_DUMP")"
 
   if [[ "$db_only" -eq 0 ]]; then
     require_command rsync
-    [[ -f "$CONTENT_ARCHIVE" ]] || die "Archivio wp-content non trovato in .wp-migrate."
+    materialize_asset "$CONTENT_ARCHIVE" "$MIGRATE_CACHE_DIR/$(basename "$CONTENT_ARCHIVE")"
 
     temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/wp-migrate.XXXXXX")"
     trap 'rm -rf "$temp_dir"' EXIT
 
     info "Estraggo $UPLOADS_PATH..."
-    tar -xzf "$CONTENT_ARCHIVE" -C "$temp_dir"
+    tar -xzf "$MIGRATE_CACHE_DIR/$(basename "$CONTENT_ARCHIVE")" -C "$temp_dir"
 
     [[ -d "$temp_dir/$UPLOADS_PATH" ]] || die "Archivio non valido: $UPLOADS_PATH non trovato."
 

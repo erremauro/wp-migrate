@@ -8,6 +8,7 @@ CLI shell per migrare un'istanza WordPress tramite una cartella `.wp-migrate` ve
 - `wp` (WP-CLI)
 - `tar`
 - `rsync`
+- `split`
 - `bash`
 
 ## Installazione
@@ -45,14 +46,16 @@ Esempi:
 ### `wp-migrate init`
 
 - crea `.wp-migrate`
-- salva la configurazione in `.wp-migrate/config.json`
+- salva la configurazione in `.wp-migrate/config`
 - inizializza un repository git locale dentro `.wp-migrate`
 - collega il remote `origin`
 
 ### `wp-migrate push`
 
-- esporta il database in `.wp-migrate/database.sql`
-- comprime `wp-content/uploads` in `.wp-migrate/uploads.tar.gz`
+- esporta il database in un file temporaneo
+- comprime `wp-content/uploads` in un archivio temporaneo
+- salva database e archivio in `.wp-migrate` come file singoli oppure chunk `.part-XXXX` se superano circa 95 MB
+- genera un manifest per ogni asset e rimuove eventuali chunk obsoleti da push precedenti
 - incrementa la versione patch in config
 - crea commit e tag `vX.Y.Z`
 - esegue push del branch e dei tag verso il repository remoto
@@ -60,11 +63,12 @@ Esempi:
 ### `wp-migrate pull`
 
 - aggiorna il contenuto di `.wp-migrate` con `git fetch` + `git pull`
+- ricostruisce una cache locale in `.wp-migrate/.cache` per gli asset splittati senza sporcare il repository git
 
 ### `wp-migrate sync`
 
-- importa `.wp-migrate/database.sql`
-- estrae `.wp-migrate/uploads.tar.gz`
+- ricostruisce il database da `.wp-migrate/database.sql` o dai suoi chunk
+- ricostruisce l'archivio uploads da `.wp-migrate/uploads.tar.gz` o dai suoi chunk
 - sincronizza i file in `wp-content/uploads` con `rsync --delete`
 - esegue `wp search-replace "<URL_REMOTO>" "<URL_LOCALE>"`
 
