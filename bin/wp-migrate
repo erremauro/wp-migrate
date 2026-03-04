@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+MIGRATE_DIR=".wp-migrate"
+CONFIG_FILE="$MIGRATE_DIR/config"
+DATABASE_DUMP="$MIGRATE_DIR/database.sql"
+CONTENT_ARCHIVE="$MIGRATE_DIR/uploads.tar.gz"
+DEFAULT_BRANCH="main"
+WP_CMD=()
+UPLOADS_PATH="wp-content/uploads"
+
+info() {
+  printf '%s\n' "$1"
+}
+
+error() {
+  printf 'Errore: %s\n' "$1" >&2
+}
+
+die() {
+  error "$1"
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+wp-migrate
+
+Uso:
+  wp-migrate init
+  wp-migrate push
+  wp-migrate pull
+  wp-migrate sync [--db-only|-d]
+EOF
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Dipendenza richiesta non trovata: $1"
+}
+
+resolve_wp_cli() {
+  local candidates=()
+  local candidate
+  local resolved=""
+  local php_bin="${PHP_BIN:-}"
+
+  if [[ -n "$php_bin" ]]; then
+    [[ -x "$php_bin" ]] || die "PHP_BIN non valido o non eseguibile: $php_bin"
+  fi
+
+  if [[ -n "${WP_CLI_BIN:-}" ]]; then
+    candidates+=("$WP_CLI_BIN")
+  fi
+
+  candidates+=(
+    "wp"
+    "./wp"
+    "./vendor/bin/wp"
+    "../vendor/bin/wp"
+  )
+
+  for candidate in "${candidates[@]}"; do
+    if [[ "$candidate" == */* ]]; then
+      [[ -x "$candidate" ]] || continue
+      resolved="$candidate"
+    elif command -v "$candidate" >/dev/null 2>&1; then
+      resolved="$(command -v "$candidate")"
+    else
+      continue
+    fi
+
+    if [[ -n "$php_bin" ]]; then
+      WP_CMD=("$php_bin" "$resolved")
+    else
+      WP_CMD=("$resolved")
+    fi
+
+    return 0
+  done
+
+  die "WP-CLI non trovato. Installa \`wp\` nel PATH oppure imposta WP_CLI_BIN con il percorso corretto."
+}
+
+ensure_wordpress_installation() {
+  [[ -f "wp-config.php" ]] || die "La cartella corrente non sembra un'installazione WordPress: wp-config.php non trovato."
+  [[ -d "wp-content" ]] || die "La cartella corrente non contiene wp-content."
+  [[ -d "$UPLOADS_PATH" ]] || die "La cartella corrente non contiene $UPLOADS_PATH."
+}
+
+ensure_migrate_dir() {
+  mkdir -p "$MIGRATE_DIR"
+}
+
+ensure_git_repo() {
+  ensure_migrate_dir
+
+  if [[ ! -d "$MIGRATE_DIR/.git" ]]; then
+    git -C "$MIGRATE_DIR" init --initial-branch="$DEFAULT_BRANCH" >/dev/null
+  fi
+}
+
+prompt() {
+  local label="$1"
+  local value=""
+
+  while true; do
+    read -r -p "$label: " value
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+
+    if [[ -n "$value" ]]; then
+      printf '%s' "$value"
+      return 0
+    fi
+  done
+}
+
+validate_remote_repository() {
+  [[ "$1" =~ ^git@[^:]+:[^/]+/[^/]+$ ]]
+}
+
+validate_url() {
+  [[ "$1" =~ ^https?://[^[:space:]]+$ ]]
+}
+
+save_config() {
+  local remote_repository="$1"
+  local remote_site_url="$2"
+  local local_site_url="$3"
+  local version="$4"
+  local branch="${5:-$DEFAULT_BRANCH}"
+
+  cat > "$CONFIG_FILE" <<EOF
+REMOTE_REPOSITORY='$remote_repository'
+REMOTE_SITE_URL='$remote_site_url'
+LOCAL_SITE_URL='$local_site_url'
+VERSION='$version'
+BRANCH='$branch'
+EOF
+}
+
+load_config() {
+  [[ -f "$CONFIG_FILE" ]] || die "Configurazione non trovata. Esegui \`wp-migrate init\`."
+
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+
+  [[ -n "${REMOTE_REPOSITORY:-}" ]] || die "Configurazione non valida: REMOTE_REPOSITORY mancante."
+  [[ -n "${REMOTE_SITE_URL:-}" ]] || die "Configurazione non valida: REMOTE_SITE_URL mancante."
+  [[ -n "${LOCAL_SITE_URL:-}" ]] || die "Configurazione non valida: LOCAL_SITE_URL mancante."
+  [[ -n "${VERSION:-}" ]] || VERSION="0.0.0"
+  [[ -n "${BRANCH:-}" ]] || BRANCH="$DEFAULT_BRANCH"
+}
+
+bump_patch_version() {
+  local version="$1"
+  local major minor patch
+
+  IFS='.' read -r major minor patch <<< "$version"
+  [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ && "$patch" =~ ^[0-9]+$ ]] || die "Versione non valida: $version"
+
+  printf '%s.%s.%s' "$major" "$minor" "$((patch + 1))"
+}
+
+configure_remote() {
+  if git -C "$MIGRATE_DIR" remote get-url origin >/dev/null 2>&1; then
+    git -C "$MIGRATE_DIR" remote set-url origin "$REMOTE_REPOSITORY"
+  else
+    git -C "$MIGRATE_DIR" remote add origin "$REMOTE_REPOSITORY"
+  fi
+}
+
+git_has_head() {
+  git -C "$MIGRATE_DIR" rev-parse --verify HEAD >/dev/null 2>&1
+}
+
+git_commit_if_needed() {
+  local message="$1"
+
+  git -C "$MIGRATE_DIR" add .
+
+  if [[ -z "$(git -C "$MIGRATE_DIR" status --porcelain)" ]]; then
+    return 0
+  fi
+
+  git -C "$MIGRATE_DIR" commit -m "$message"
+}
+
+cmd_init() {
+  local remote_repository remote_site_url local_site_url
+
+  ensure_wordpress_installation
+  require_command git
+  resolve_wp_cli
+
+  ensure_migrate_dir
+  ensure_git_repo
+
+  while true; do
+    remote_repository="$(prompt 'Repository git remoto')"
+    validate_remote_repository "$remote_repository" && break
+    error "Formato repository non valido. Usa git@<host>:<username>/<repository>"
+  done
+
+  while true; do
+    remote_site_url="$(prompt 'URL del sito remoto')"
+    validate_url "$remote_site_url" && break
+    error "URL remoto non valido."
+  done
+
+  while true; do
+    local_site_url="$(prompt 'URL del sito locale')"
+    validate_url "$local_site_url" && break
+    error "URL locale non valido."
+  done
+
+  save_config "$remote_repository" "$remote_site_url" "$local_site_url" "0.0.0" "$DEFAULT_BRANCH"
+  load_config
+  configure_remote
+
+  info "Configurazione salvata in $CONFIG_FILE"
+}
+
+cmd_push() {
+  local next_version
+
+  ensure_wordpress_installation
+  require_command git
+  resolve_wp_cli
+  require_command tar
+
+  ensure_migrate_dir
+  ensure_git_repo
+  load_config
+  configure_remote
+
+  info "Esporto il database WordPress..."
+  "${WP_CMD[@]}" db export "$DATABASE_DUMP" --add-drop-table
+
+  info "Comprimo $UPLOADS_PATH..."
+  tar -czf "$CONTENT_ARCHIVE" "$UPLOADS_PATH"
+
+  next_version="$(bump_patch_version "$VERSION")"
+  save_config "$REMOTE_REPOSITORY" "$REMOTE_SITE_URL" "$LOCAL_SITE_URL" "$next_version" "$BRANCH"
+
+  info "Creo commit e tag v$next_version..."
+  git_commit_if_needed "Release v$next_version"
+  git -C "$MIGRATE_DIR" tag "v$next_version"
+
+  info "Sincronizzo il repository remoto..."
+  git -C "$MIGRATE_DIR" push -u origin "$BRANCH"
+  git -C "$MIGRATE_DIR" push origin --tags
+
+  info "Push completato: v$next_version"
+}
+
+cmd_pull() {
+  require_command git
+
+  ensure_migrate_dir
+  load_config
+  ensure_git_repo
+  configure_remote
+
+  info "Aggiorno .wp-migrate dal repository remoto..."
+  git -C "$MIGRATE_DIR" fetch --tags origin
+
+  if git_has_head; then
+    git -C "$MIGRATE_DIR" checkout "$BRANCH"
+  else
+    git -C "$MIGRATE_DIR" checkout -B "$BRANCH" --track "origin/$BRANCH"
+  fi
+
+  git -C "$MIGRATE_DIR" pull origin "$BRANCH"
+  info "Pull completato."
+}
+
+cmd_sync() {
+  local db_only=0
+  local temp_dir
+
+  ensure_wordpress_installation
+  resolve_wp_cli
+  require_command tar
+
+  for arg in "$@"; do
+    case "$arg" in
+      --db-only|-d)
+        db_only=1
+        ;;
+      *)
+        die "Opzione non supportata: $arg"
+        ;;
+    esac
+  done
+
+  load_config
+  [[ -f "$DATABASE_DUMP" ]] || die "Dump database non trovato in .wp-migrate."
+
+  info "Importo il dump SQL..."
+  "${WP_CMD[@]}" db import "$DATABASE_DUMP"
+
+  if [[ "$db_only" -eq 0 ]]; then
+    require_command rsync
+    [[ -f "$CONTENT_ARCHIVE" ]] || die "Archivio wp-content non trovato in .wp-migrate."
+
+    temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/wp-migrate.XXXXXX")"
+    trap 'rm -rf "$temp_dir"' EXIT
+
+    info "Estraggo $UPLOADS_PATH..."
+    tar -xzf "$CONTENT_ARCHIVE" -C "$temp_dir"
+
+    [[ -d "$temp_dir/$UPLOADS_PATH" ]] || die "Archivio non valido: $UPLOADS_PATH non trovato."
+
+    info "Allineo i file di $UPLOADS_PATH..."
+    rsync -a --delete "$temp_dir/$UPLOADS_PATH/" "$UPLOADS_PATH/"
+
+    rm -rf "$temp_dir"
+    trap - EXIT
+  fi
+
+  info "Eseguo search-replace degli URL..."
+  "${WP_CMD[@]}" search-replace "$REMOTE_SITE_URL" "$LOCAL_SITE_URL" --skip-columns=guid
+
+  if [[ "$db_only" -eq 1 ]]; then
+    info "Sync database completato."
+  else
+    info "Sync completo."
+  fi
+}
+
+main() {
+  local command="${1:-help}"
+
+  case "$command" in
+    init)
+      shift
+      cmd_init "$@"
+      ;;
+    push)
+      shift
+      cmd_push "$@"
+      ;;
+    pull)
+      shift
+      cmd_pull "$@"
+      ;;
+    sync)
+      shift
+      cmd_sync "$@"
+      ;;
+    help|--help|-h)
+      usage
+      ;;
+    *)
+      usage
+      die "Comando sconosciuto: $command"
+      ;;
+  esac
+}
+
+main "$@"
