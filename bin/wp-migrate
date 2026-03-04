@@ -135,6 +135,20 @@ validate_url() {
   [[ "$1" =~ ^https?://[^[:space:]]+$ ]]
 }
 
+config_value() {
+  local file_path="$1"
+  local key="$2"
+
+  [[ -f "$file_path" ]] || return 0
+
+  (
+    unset REMOTE_REPOSITORY REMOTE_SITE_URL LOCAL_SITE_URL VERSION BRANCH
+    # shellcheck disable=SC1090
+    source "$file_path"
+    eval "printf '%s' \"\${$key:-}\""
+  )
+}
+
 manifest_path() {
   printf '%s.manifest' "$1"
 }
@@ -411,12 +425,30 @@ cmd_push() {
 }
 
 cmd_pull() {
+  local bootstrap_pull=0
+  local temp_dir=""
+  local backup_config=""
+  local local_remote_repository=""
+  local local_remote_site_url=""
+  local local_local_site_url=""
+  local local_version=""
+  local local_branch=""
+  local remote_version=""
+  local remote_remote_site_url=""
+
   require_command git
 
   ensure_migrate_dir
   load_config
   ensure_git_repo
   configure_remote
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/wp-migrate.XXXXXX")"
+  trap 'rm -rf "$temp_dir"' EXIT
+
+  backup_config="$temp_dir/config.backup"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    cp "$CONFIG_FILE" "$backup_config"
+  fi
 
   info "Aggiorno .wp-migrate dal repository remoto..."
   git -C "$MIGRATE_DIR" fetch --tags origin
@@ -424,11 +456,33 @@ cmd_pull() {
   if git_has_head; then
     git -C "$MIGRATE_DIR" checkout "$BRANCH"
   else
+    bootstrap_pull=1
+    rm -f "$CONFIG_FILE" "$MIGRATE_GITIGNORE"
     git -C "$MIGRATE_DIR" checkout -B "$BRANCH" --track "origin/$BRANCH"
   fi
 
   git -C "$MIGRATE_DIR" pull origin "$BRANCH"
+
+  if [[ "$bootstrap_pull" -eq 1 && -f "$backup_config" && -f "$CONFIG_FILE" ]]; then
+    local_remote_repository="$(config_value "$backup_config" "REMOTE_REPOSITORY")"
+    local_remote_site_url="$(config_value "$backup_config" "REMOTE_SITE_URL")"
+    local_local_site_url="$(config_value "$backup_config" "LOCAL_SITE_URL")"
+    local_version="$(config_value "$backup_config" "VERSION")"
+    local_branch="$(config_value "$backup_config" "BRANCH")"
+    remote_remote_site_url="$(config_value "$CONFIG_FILE" "REMOTE_SITE_URL")"
+    remote_version="$(config_value "$CONFIG_FILE" "VERSION")"
+
+    save_config \
+      "${local_remote_repository:-$REMOTE_REPOSITORY}" \
+      "${remote_remote_site_url:-${local_remote_site_url:-$REMOTE_SITE_URL}}" \
+      "${local_local_site_url:-$LOCAL_SITE_URL}" \
+      "${remote_version:-${local_version:-$VERSION}}" \
+      "${local_branch:-$BRANCH}"
+  fi
+
   hydrate_cached_artifacts
+  rm -rf "$temp_dir"
+  trap - EXIT
   info "Pull completato."
 }
 
