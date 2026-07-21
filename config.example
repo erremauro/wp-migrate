@@ -1,0 +1,3 @@
+REMOTE_REPOSITORY='git@github.com:tuo-utente/tuo-repo-migrate.git'
+REMOTE_SITE_URL='https://staging.tuosito.it'
+BRANCH='main'

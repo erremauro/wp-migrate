@@ -36,6 +36,7 @@ Uso:
   wp-migrate push
   wp-migrate pull
   wp-migrate sync [--db-only|-d]
+  wp-migrate import <file.sql|file.sql.gz>
 EOF
 }
 
@@ -100,7 +101,9 @@ ensure_migrate_dir() {
 
 write_migrate_gitignore() {
   cat > "$MIGRATE_GITIGNORE" <<'EOF'
+.gitignore
 .cache/
+config
 config.local
 EOF
 }
@@ -268,16 +271,14 @@ hydrate_cached_artifacts() {
   hydrate_cached_asset_if_present "$CONTENT_ARCHIVE" "$MIGRATE_CACHE_DIR/$(basename "$CONTENT_ARCHIVE")"
 }
 
-save_shared_config() {
+save_project_config() {
   local remote_repository="$1"
   local remote_site_url="$2"
-  local version="$3"
-  local branch="${4:-$DEFAULT_BRANCH}"
+  local branch="${3:-$DEFAULT_BRANCH}"
 
   cat > "$CONFIG_FILE" <<EOF
 REMOTE_REPOSITORY='$remote_repository'
 REMOTE_SITE_URL='$remote_site_url'
-VERSION='$version'
 BRANCH='$branch'
 EOF
 }
@@ -290,16 +291,15 @@ LOCAL_SITE_URL='$local_site_url'
 EOF
 }
 
-load_shared_config() {
+load_project_config() {
   [[ -f "$CONFIG_FILE" ]] || die "Configurazione non trovata. Esegui \`wp-migrate init\`."
 
-  unset REMOTE_REPOSITORY REMOTE_SITE_URL VERSION BRANCH
+  unset REMOTE_REPOSITORY REMOTE_SITE_URL BRANCH
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
 
   [[ -n "${REMOTE_REPOSITORY:-}" ]] || die "Configurazione non valida: REMOTE_REPOSITORY mancante."
   [[ -n "${REMOTE_SITE_URL:-}" ]] || die "Configurazione non valida: REMOTE_SITE_URL mancante."
-  [[ -n "${VERSION:-}" ]] || VERSION="0.0.0"
   [[ -n "${BRANCH:-}" ]] || BRANCH="$DEFAULT_BRANCH"
 }
 
@@ -322,7 +322,7 @@ load_local_config() {
 }
 
 load_config() {
-  load_shared_config
+  load_project_config
   load_local_config
 }
 
@@ -334,6 +334,24 @@ bump_patch_version() {
   [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ && "$patch" =~ ^[0-9]+$ ]] || die "Versione non valida: $version"
 
   printf '%s.%s.%s' "$major" "$minor" "$((patch + 1))"
+}
+
+current_version() {
+  local latest_tag
+
+  latest_tag="$(git -C "$MIGRATE_DIR" tag -l 'v*' | sed 's/^v//' | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)"
+
+  printf '%s' "${latest_tag:-0.0.0}"
+}
+
+untrack_local_only_files() {
+  local name
+
+  for name in "$(basename "$CONFIG_FILE")" "$(basename "$MIGRATE_GITIGNORE")"; do
+    if git -C "$MIGRATE_DIR" ls-files --error-unmatch "$name" >/dev/null 2>&1; then
+      git -C "$MIGRATE_DIR" rm --cached -q "$name"
+    fi
+  done
 }
 
 configure_remote() {
@@ -388,7 +406,7 @@ cmd_init() {
     error "URL locale non valido."
   done
 
-  save_shared_config "$remote_repository" "$remote_site_url" "0.0.0" "$DEFAULT_BRANCH"
+  save_project_config "$remote_repository" "$remote_site_url" "$DEFAULT_BRANCH"
   save_local_config "$local_site_url"
   load_config
   configure_remote
@@ -411,6 +429,9 @@ cmd_push() {
   load_config
   configure_remote
 
+  info "Recupero i tag di versione dal repository remoto..."
+  git -C "$MIGRATE_DIR" fetch --tags origin
+
   temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/wp-migrate.XXXXXX")"
   trap 'rm -rf "$temp_dir"' EXIT
 
@@ -428,8 +449,8 @@ cmd_push() {
   rm -rf "$temp_dir"
   trap - EXIT
 
-  next_version="$(bump_patch_version "$VERSION")"
-  save_shared_config "$REMOTE_REPOSITORY" "$REMOTE_SITE_URL" "$next_version" "$BRANCH"
+  next_version="$(bump_patch_version "$(current_version)")"
+  untrack_local_only_files
 
   info "Creo commit e tag v$next_version..."
   git_commit_if_needed "Release v$next_version"
@@ -453,14 +474,21 @@ cmd_pull() {
   info "Aggiorno .wp-migrate dal repository remoto..."
   git -C "$MIGRATE_DIR" fetch --tags origin
 
+  # config e .gitignore sono solo locali e non arrivano mai dal repository condiviso:
+  # li rimuoviamo prima del checkout cosi' non possono mai bloccare il merge, e li
+  # rigeneriamo subito dopo con i valori di questa macchina.
+  rm -f "$CONFIG_FILE" "$MIGRATE_GITIGNORE"
+
   if git_has_head; then
     git -C "$MIGRATE_DIR" checkout "$BRANCH"
   else
-    rm -f "$CONFIG_FILE" "$MIGRATE_GITIGNORE"
     git -C "$MIGRATE_DIR" checkout -B "$BRANCH" --track "origin/$BRANCH"
   fi
 
   git -C "$MIGRATE_DIR" pull origin "$BRANCH"
+
+  save_project_config "$REMOTE_REPOSITORY" "$REMOTE_SITE_URL" "$BRANCH"
+  write_migrate_gitignore
 
   hydrate_cached_artifacts
   info "Pull completato."
@@ -520,6 +548,46 @@ cmd_sync() {
   fi
 }
 
+cmd_import() {
+  local sql_file="${1:-}"
+  local temp_dir=""
+  local target_sql
+
+  [[ -n "$sql_file" ]] || die "Specifica il file da importare. Uso: wp-migrate import <file.sql|file.sql.gz>"
+  [[ -f "$sql_file" ]] || die "File non trovato: $sql_file"
+
+  ensure_wordpress_installation
+  resolve_wp_cli
+
+  case "$sql_file" in
+    *.sql.gz|*.gz)
+      require_command gunzip
+      temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/wp-migrate.XXXXXX")"
+      trap 'rm -rf "$temp_dir"' EXIT
+      target_sql="$temp_dir/$(basename "${sql_file%.gz}")"
+
+      info "Decomprimo $sql_file..."
+      gunzip -c "$sql_file" > "$target_sql"
+      ;;
+    *.sql)
+      target_sql="$sql_file"
+      ;;
+    *)
+      die "Formato non supportato: $sql_file (atteso .sql o .sql.gz)"
+      ;;
+  esac
+
+  info "Importo il dump SQL..."
+  "${WP_CMD[@]}" db import "$target_sql"
+
+  if [[ -n "$temp_dir" ]]; then
+    rm -rf "$temp_dir"
+    trap - EXIT
+  fi
+
+  info "Import completato."
+}
+
 main() {
   local command="${1:-help}"
 
@@ -539,6 +607,10 @@ main() {
     sync)
       shift
       cmd_sync "$@"
+      ;;
+    import)
+      shift
+      cmd_import "$@"
       ;;
     help|--help|-h)
       usage
